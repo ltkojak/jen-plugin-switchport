@@ -509,6 +509,33 @@ def main():
         got = {r["title"]: r["subnet_id"] for r in p._switchport_search("Gi", [], False)}
         check(got == expected, f"_switchport_search: {label} gets {expected} (got {got})")
 
+    # ── 1.0.3: a database failure never reaches the page ─────────────────────
+    def db_down(*a, **k):
+        raise RuntimeError("Access denied for user 'jen'@'10.9.9.9' marker-q96")
+
+    flashed.clear()
+    p._can = everything
+    p._get_db = db_down
+    p.request = types.SimpleNamespace(form={"name": "x", "host": "10.1.0.5", "vlan_indexing": "none"}, args={})
+    p.add_switch()
+    check(
+        flashed and all("marker-q96" not in m and "10.9.9.9" not in m for m in flashed) and "Jen's log" in flashed[-1],
+        f"add_switch: a database failure shows a generic message and no exception text (got {flashed})",
+    )
+
+    # ── 1.0.3: the MAC's subnet is Jen's ONE precedence ──────────────────────
+    api = types.ModuleType("jen.plugin_api")
+    api.client_subnet_for_mac = lambda mac: {"aa:bb:cc:dd:ee:09": 4}.get(mac)
+    sys.modules["jen"] = types.ModuleType("jen")
+    sys.modules["jen.plugin_api"] = api
+    sys.modules["jen"].plugin_api = api
+    fresh = load_plugin()
+    check(
+        fresh._current_subnet_for_mac("aa:bb:cc:dd:ee:09") == 4
+        and fresh._current_subnet_for_mac("aa:bb:cc:dd:ee:10") is None,
+        "_current_subnet_for_mac: answered by plugin_api.client_subnet_for_mac, not a private copy",
+    )
+
     # ── register(): runs end to end against a stub that enforces Jen's rules ──
     calls = _stub_jen_plugin_api()
     try:
