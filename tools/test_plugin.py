@@ -37,6 +37,9 @@ def _stub_modules():
 
             return deco
 
+        def add_url_rule(self, *a, **k):
+            pass
+
     flask.Blueprint = Blueprint
     for name in ("flash", "jsonify", "make_response", "redirect", "render_template", "url_for"):
         setattr(flask, name, lambda *a, **k: None)
@@ -46,6 +49,43 @@ def _stub_modules():
     fl.current_user = types.SimpleNamespace(username="tester", all_subnets=True, role="admin")
     fl.login_required = lambda fn: fn
     sys.modules["flask_login"] = fl
+
+
+class _FakeApp:
+    def register_blueprint(self, bp):
+        pass
+
+
+def _stub_jen_plugin_api():
+    """A stub `jen.plugin_api` sufficient for register(app) to run end to end, enforcing the SAME two
+    rules Jen's real one does: an alert type id must start with '<plugin_id>_', and a periodic job may
+    not run more often than PERIODIC_MIN_MINUTES (5). A plugin that breaks either raises at register()
+    in Jen, is swallowed by its per-plugin error handling, and never loads - the way watchdog 1.0.0 and
+    dns-sync 1.0.0 shipped dead (Q89). Returns the registered calls."""
+    calls = {"alert_types": [], "periodic": [], "row_actions": [], "search": []}
+
+    def register_alert_type(plugin_id, type_id, **kwargs):
+        prefix = f"{plugin_id}_"
+        if not type_id.startswith(prefix):
+            raise ValueError(f"type_id {type_id!r} must start with {prefix!r}")
+        calls["alert_types"].append(type_id)
+
+    def register_periodic(plugin_id, name, fn, every_minutes):
+        if every_minutes < 5:
+            raise ValueError("every_minutes must be at least 5")
+        calls["periodic"].append((plugin_id, name, every_minutes))
+
+    jen_pkg = types.ModuleType("jen")
+    plugin_api = types.ModuleType("jen.plugin_api")
+    plugin_api.register_alert_type = register_alert_type
+    plugin_api.register_periodic = register_periodic
+    plugin_api.register_row_action = lambda *a, **k: calls["row_actions"].append(a)
+    plugin_api.register_search_provider = lambda *a, **k: calls["search"].append(a)
+    plugin_api.api_key_required = lambda write=False: lambda fn: fn
+    jen_pkg.plugin_api = plugin_api
+    sys.modules["jen"] = jen_pkg
+    sys.modules["jen.plugin_api"] = plugin_api
+    return calls
 
 
 def load_plugin():
@@ -238,6 +278,244 @@ def main():
         check(gated, f"{fn.__name__} refuses a viewer before touching the request")
     p.current_user.role = "admin"
     check(p._is_admin() is True, "admin role restored for the rest of the run")
+
+    # ── 1.0.1: the uplink heuristic's result is visible ───────────────────────
+    check(p.port_is_uplink(None, 9) is True, "port_is_uplink: unpinned and over the threshold is an uplink")
+    check(p.port_is_uplink(None, 8) is False, "port_is_uplink: exactly the threshold is not")
+    check(p.port_is_uplink(1, 0) is True, "port_is_uplink: a manual uplink pin wins under the threshold")
+    check(p.port_is_uplink(0, 40) is False, "port_is_uplink: a manual 'not an uplink' pin wins over the threshold")
+    check(p.port_is_uplink(None, None) is False, "port_is_uplink: a port with no count yet is not an uplink")
+
+    # ── 1.0.1: the host of a switch becomes an snmpbulkwalk argument ─────────
+    for good in ("10.0.0.2", "core-sw.lan", "sw1", "a.b-c.d"):
+        check(p.valid_switch_host(good) is True, f"valid_switch_host: {good!r} is accepted")
+    for bad in ("", "-v3", "--help", "-Cr10", "a b", "10.0.0.2;reboot", "sw$1", "sw_1 ", "x" * 256, ".lan", "lan-"):
+        check(p.valid_switch_host(bad) is False, f"valid_switch_host: {bad[:20]!r} is refused")
+
+    # ── 1.0.1: a switch belongs to the subnet its address is in ──────────────
+    smap = {1: {"cidr": "10.1.0.0/24"}, 2: {"cidr": "10.2.0.0/24"}}
+    check(p.derive_subnet_id("10.2.0.9", smap) == 2, "derive_subnet_id: an address in subnet 2")
+    check(p.derive_subnet_id("172.16.0.1", smap) is None, "derive_subnet_id: an address in no subnet is None")
+    check(p.derive_subnet_id("core-sw.lan", smap) is None, "derive_subnet_id: a hostname is None, never guessed")
+
+    # ── a fake database and request, to run the impure code ──────────────────
+    class FakeDB:
+        def __init__(self, selects=None):
+            self.statements = []
+            self.selects = list(selects or [])
+
+        def cursor(self):
+            return self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=()):
+            self.statements.append((sql.split()[0].upper(), sql, params))
+
+        def fetchone(self):
+            return self.selects.pop(0) if self.selects else None
+
+        def fetchall(self):
+            return self.selects.pop(0) if self.selects else []
+
+        def commit(self):
+            pass
+
+        def close(self):
+            pass
+
+        def kinds(self):
+            return [s[0] for s in self.statements]
+
+    only_one = lambda sid: sid == 1  # noqa: E731 - a subnet-restricted caller: subnet 1; None is not theirs
+    everything = lambda sid: True  # noqa: E731 - an unrestricted caller
+    flashed = []
+    p.flash = lambda msg, cat="message": flashed.append(msg)
+    p.redirect = lambda where: "redirect"
+    p.url_for = lambda *a, **k: "/x"
+    p.jsonify = lambda payload: payload
+    p._require_write = lambda: True
+    p._subnet_map = lambda: smap
+    jen_api = types.ModuleType("jen.plugin_api")
+    jen_api.decrypt_secret = lambda s: s
+    sys.modules["jen"] = types.ModuleType("jen")
+    sys.modules["jen.plugin_api"] = jen_api
+    sys.modules["jen"].plugin_api = jen_api
+
+    # ── 1.0.1: switches are judged on their own address ──────────────────────
+    for label, host in (("a switch in subnet 2", "10.2.0.2"), ("a switch addressed by hostname", "core-sw.lan")):
+        for name, args in (("toggle_switch", (7,)), ("delete_switch", (7,)), ("set_uplink", (7, 12))):
+            fdb = FakeDB([{"id": 7, "host": host, "enabled": 1}])
+            p._get_db = lambda fdb=fdb: fdb
+            p._can = only_one
+            p.request = types.SimpleNamespace(form={"value": "up"})
+            getattr(p, name)(*args)
+            check(
+                fdb.kinds() == ["SELECT"] and flashed[-1] == "Switch not found.",
+                f"{name}: {label} reads as not found to a caller scoped to subnet 1 — nothing written",
+            )
+    fdb = FakeDB([{"id": 7, "host": "10.1.0.2", "enabled": 1}])
+    p._get_db = lambda fdb=fdb: fdb
+    p.set_uplink(7, 12)
+    check("UPDATE" in fdb.kinds(), "set_uplink: a switch in the caller's own subnet can be changed")
+    fdb = FakeDB([{"id": 7, "host": "core-sw.lan", "enabled": 1}])
+    p._get_db = lambda fdb=fdb: fdb
+    p._can = everything
+    p.delete_switch(7)
+    check("DELETE" in fdb.kinds(), "delete_switch: an unrestricted caller may remove a switch addressed by hostname")
+
+    # ── 1.0.1: adding a switch validates the host and judges its subnet ──────
+    for label, host, can in (
+        ("an option-shaped host", "-v3", everything),
+        ("a hostname, for a scoped caller", "core-sw.lan", only_one),
+        ("an address in another subnet, for a scoped caller", "10.2.0.5", only_one),
+    ):
+        fdb = FakeDB()
+        p._get_db = lambda fdb=fdb: fdb
+        p._can = can
+        p.request = types.SimpleNamespace(form={"name": "sw", "host": host, "vlan_indexing": "none"})
+        p.add_switch()
+        check(fdb.statements == [], f"add_switch: {label} is refused, nothing stored")
+    fdb = FakeDB()
+    p._get_db = lambda fdb=fdb: fdb
+    p._can = only_one
+    p.request = types.SimpleNamespace(form={"name": "sw", "host": "10.1.0.5", "vlan_indexing": "none"})
+    p.add_switch()
+    check("INSERT" in fdb.kinds(), "add_switch: an address in the caller's own subnet is accepted")
+
+    # ── 1.0.1: the page lists only the switches the caller may see, with counts ─
+    switches = [
+        {"id": 1, "name": "mine", "host": "10.1.0.2", "vlan_indexing": "none", "vlans": None, "enabled": 1},
+        {"id": 2, "name": "theirs", "host": "10.2.0.2", "vlan_indexing": "none", "vlans": None, "enabled": 1},
+        {"id": 3, "name": "by-name", "host": "core-sw.lan", "vlan_indexing": "none", "vlans": None, "enabled": 1},
+    ]
+    ports = [
+        {"ifindex": 1, "ifname": "Gi1", "ifalias": "", "is_uplink": None, "mac_count": 37},
+        {"ifindex": 2, "ifname": "Gi2", "ifalias": "", "is_uplink": None, "mac_count": 1},
+    ]
+    for label, can, expected in (
+        ("a scoped caller", only_one, ["mine"]),
+        ("an unrestricted caller", everything, ["mine", "theirs", "by-name"]),
+    ):
+        fdb = FakeDB(
+            [[dict(s) for s in switches], [dict(x) for x in ports], [dict(x) for x in ports], [dict(x) for x in ports]]
+        )
+        p._get_db = lambda fdb=fdb: fdb
+        p._can = can
+        rows = p._switch_rows()
+        check(
+            [s["name"] for s in rows] == expected,
+            f"_switch_rows: {label} sees {expected} (got {[s['name'] for s in rows]})",
+        )
+    check(
+        [x["uplink"] for x in rows[0]["ports"]] == [True, False],
+        "_switch_rows: a port with 37 MACs is flagged an uplink, one with 1 is not — from the STORED count",
+    )
+
+    # ── 1.0.1: polling records every port's real MAC count, uplinks included ─
+    IFINDEX = "".join(f".1.3.6.1.2.1.17.1.4.1.2.{n} = INTEGER: {10100 + n}\n" for n in (1, 2))
+    NAMES = "".join(f'.1.3.6.1.2.1.31.1.1.1.1.{10100 + n} = STRING: "Gi{n}"\n' for n in (1, 2))
+    ALIASES = "".join(f'.1.3.6.1.2.1.31.1.1.1.18.{10100 + n} = STRING: ""\n' for n in (1, 2))
+    fdb_lines = [f".1.3.6.1.2.1.17.7.1.2.2.1.2.10.0.0.0.0.0.{n} = INTEGER: 1\n" for n in range(1, 10)]  # 9 MACs, port 1
+    fdb_lines.append(".1.3.6.1.2.1.17.7.1.2.2.1.2.10.0.0.0.0.1.1 = INTEGER: 2\n")  # 1 MAC, port 2
+    walks = {
+        p.OID_DOT1D_BASE_PORT_IFINDEX: IFINDEX,
+        p.OID_IF_NAME: NAMES,
+        p.OID_IF_ALIAS: ALIASES,
+        p.OID_DOT1Q_TP_FDB_PORT: "".join(fdb_lines),
+    }
+    p._run_snmpbulkwalk = lambda host, community, oid, timeout=20: walks[oid]
+    fdb = FakeDB([[], [], []])  # port overrides, old positions, previously-here rows
+    p._get_db = lambda: fdb
+    p._poll_switch({"id": 4, "name": "s", "host": "10.1.0.2", "community": "", "vlan_indexing": "none", "vlans": None})
+    stored = {s[2][1]: s[2][4] for s in fdb.statements if s[0] == "INSERT" and "sp_ports" in s[1]}
+    check(
+        stored == {10101: 9, 10102: 1},
+        f"_poll_switch: the uplink-shaped port stores its 9 MACs, the desk port its 1 (got {stored})",
+    )
+    located_inserts = [s for s in fdb.statements if s[0] == "INSERT" and "sp_mac_ports" in s[1]]
+    check(len(located_inserts) == 1, "_poll_switch: only the MAC NOT behind the auto-detected uplink is located")
+
+    # ── 1.0.1: a move sends the alert, in the MAC's own subnet, and the event ─
+    sent, emitted = [], []
+    jen_api.send_alert = lambda alert_type, subnet_id=None, **kw: sent.append((alert_type, subnet_id, kw))
+    jen_api.emit = lambda kind, **kw: emitted.append((kind, kw))
+    p._port_label = lambda switch_id, ifindex: f"sw{switch_id}:{ifindex}"
+    p._current_subnet_for_mac = lambda mac: 1
+    p._emit_move("aa:bb:cc:dd:ee:ff", (1, 12), (2, 7))
+    check(
+        sent == [("switchport_moved", 1, {"mac": "aa:bb:cc:dd:ee:ff", "old": "sw1:12", "new": "sw2:7"})],
+        f"_emit_move: sends switchport_moved for the MAC's own subnet (got {sent})",
+    )
+    check(emitted and emitted[0][0] == "plugin.switchport.moved", "_emit_move: still emits the Timeline event")
+
+    # ── 1.0.1: the locate API — a MAC with no subnet is for an unrestricted key only ─
+    def key_can(key, subnet_id, *, allow_unattributed=False):
+        scope = key.get("subnet_ids")
+        if scope is None:
+            return True
+        return subnet_id is not None and subnet_id in scope
+
+    jen_api.api_key_can_access_subnet = key_can
+    p._locate_mac = lambda mac: None
+    for label, sid, key, expect in (
+        ("a scoped key, MAC in its subnet", 1, {"subnet_ids": [1]}, "ok"),
+        ("a scoped key, MAC in another subnet", 2, {"subnet_ids": [1]}, 403),
+        ("a scoped key, MAC with no subnet", None, {"subnet_ids": [1]}, 403),
+        ("an unrestricted key, MAC with no subnet", None, {"subnet_ids": None}, "ok"),
+    ):
+        p._current_subnet_for_mac = lambda mac, sid=sid: sid
+        sys.modules["flask"].g = types.SimpleNamespace(api_key=key)
+        result = p._api_locate("aa:bb:cc:dd:ee:01")
+        got = result[1] if isinstance(result, tuple) else "ok"
+        check(got == expect, f"_api_locate: {label} -> {expect}")
+
+    # ── 1.0.1: the search provider returns the MAC's REAL subnet ─────────────
+    rows = [
+        {"mac": "aa:bb:cc:dd:ee:01", "switch_name": "s", "ifname": "Gi1"},
+        {"mac": "aa:bb:cc:dd:ee:02", "switch_name": "s", "ifname": "Gi2"},
+        {"mac": "aa:bb:cc:dd:ee:03", "switch_name": "s", "ifname": "Gi3"},
+    ]
+    subnet_of = {"aa:bb:cc:dd:ee:01": 1, "aa:bb:cc:dd:ee:02": 2, "aa:bb:cc:dd:ee:03": None}
+    p._current_subnet_for_mac = lambda mac: subnet_of[mac]
+    for label, can, expected in (
+        ("a scoped caller", only_one, {"aa:bb:cc:dd:ee:01": 1}),
+        (
+            "an unrestricted caller",
+            everything,
+            {"aa:bb:cc:dd:ee:01": 1, "aa:bb:cc:dd:ee:02": 2, "aa:bb:cc:dd:ee:03": None},
+        ),
+    ):
+        p._get_db = lambda: FakeDB([list(rows)])
+        p._can = can
+        got = {r["title"]: r["subnet_id"] for r in p._switchport_search("Gi", [], False)}
+        check(got == expected, f"_switchport_search: {label} gets {expected} (got {got})")
+
+    # ── register(): runs end to end against a stub that enforces Jen's rules ──
+    calls = _stub_jen_plugin_api()
+    try:
+        p.register(_FakeApp())
+        registered = True
+    except Exception as e:
+        registered = False
+        print(f"      register() raised: {e}")
+    check(registered, "register(): runs end to end without raising against a real-rule stub")
+    check(
+        calls["alert_types"] == ["switchport_moved"],
+        f"register(): the moved alert type is registered under the plugin's own prefix (got {calls['alert_types']})",
+    )
+    check(
+        calls["periodic"] == [("switchport", "poll", 10)],
+        f"register(): the poll runs every 10 minutes (got {calls['periodic']})",
+    )
+    check(
+        len(calls["row_actions"]) == 3 and len(calls["search"]) == 1,
+        "register(): three row actions and one search provider",
+    )
 
     if failures:
         print(f"\n{len(failures)} check(s) failed")
