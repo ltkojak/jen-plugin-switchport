@@ -64,10 +64,24 @@ def _stub_jen_plugin_api():
     dns-sync 1.0.0 shipped dead (Q89). Returns the registered calls."""
     calls = {"alert_types": [], "periodic": [], "row_actions": [], "search": []}
 
+    # Jen's own tests (tests/test_q57_quickwins.py, tests/test_icons.py) hold every alert type to these two
+    # lists: a default template must open with one of the four standard glyphs, and the icon must be one the
+    # dashboard's alert whitelist knows. 1.0.1 used a glyph and an icon outside them and failed Jen's CI.
+    glyphs = ("\U0001f6a8", "\u26a0\ufe0f", "\u2705", "\u2139\ufe0f")
+    icons = (
+        "clock", "trash", "badge-question-mark", "pin", "info", "circle-check", "chart-bar", "siren", "lock",
+        "clipboard-list", "triangle-alert", "circle-x", "plus", "zap", "bell", "trending-up",
+    )  # fmt: skip
+
     def register_alert_type(plugin_id, type_id, **kwargs):
         prefix = f"{plugin_id}_"
         if not type_id.startswith(prefix):
             raise ValueError(f"type_id {type_id!r} must start with {prefix!r}")
+        lead = kwargs.get("default_template", "").split(" ", 1)[0]
+        if lead not in glyphs:
+            raise ValueError(f"default_template must open with a standard glyph, got {lead!r}")
+        if kwargs.get("icon") not in icons:
+            raise ValueError(f"icon {kwargs.get('icon')!r} is not in the dashboard alert-icon whitelist")
         calls["alert_types"].append(type_id)
 
     def register_periodic(plugin_id, name, fn, every_minutes):
