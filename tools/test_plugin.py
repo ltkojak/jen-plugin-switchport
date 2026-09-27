@@ -96,6 +96,22 @@ def _stub_jen_plugin_api():
     plugin_api.register_row_action = lambda *a, **k: calls["row_actions"].append(a)
     plugin_api.register_search_provider = lambda *a, **k: calls["search"].append(a)
     plugin_api.api_key_required = lambda write=False: lambda fn: fn
+
+    def normalize_mac(raw):
+        import re as _re
+
+        if not isinstance(raw, str) or not raw.strip():
+            return None
+        cleaned = _re.sub(r"[^0-9a-fA-F]", "", raw).lower()
+        if len(cleaned) != 12:
+            return None
+        mac = ":".join(cleaned[i : i + 2] for i in range(0, 12, 2))
+        return mac if _re.match(r"^([0-9a-f]{2}:){5}[0-9a-f]{2}$", mac) else None
+
+    plugin_api.normalize_mac = normalize_mac
+    plugin_api.like_pattern = lambda text: (
+        "%" + str(text).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+    )
     jen_pkg.plugin_api = plugin_api
     sys.modules["jen"] = jen_pkg
     sys.modules["jen.plugin_api"] = plugin_api
@@ -270,6 +286,7 @@ def main():
     check(new_mac == [], "detect_moves: a mac never seen before is not a move")
 
     # ── MAC normalisation ────────────────────────────────────────────────────
+    _stub_jen_plugin_api()
     check(p._normalize_mac("AA:BB:CC:DD:EE:FF") == "aa:bb:cc:dd:ee:ff", "_normalize_mac: uppercase colon form")
     check(p._normalize_mac("aabbccddeeff") == "aa:bb:cc:dd:ee:ff", "_normalize_mac: bare hex form")
     check(p._normalize_mac("not-a-mac") == "", "_normalize_mac: garbage is refused, not raised")
@@ -314,9 +331,10 @@ def main():
 
     # ── a fake database and request, to run the impure code ──────────────────
     class FakeDB:
-        def __init__(self, selects=None):
+        def __init__(self, selects=None, rowcount=1):
             self.statements = []
             self.selects = list(selects or [])
+            self.rowcount = rowcount
 
         def cursor(self):
             return self
@@ -356,6 +374,8 @@ def main():
     p._subnet_map = lambda: smap
     jen_api = types.ModuleType("jen.plugin_api")
     jen_api.decrypt_secret = lambda s: s
+    jen_api.normalize_mac = sys.modules["jen.plugin_api"].normalize_mac
+    jen_api.like_pattern = sys.modules["jen.plugin_api"].like_pattern
     sys.modules["jen"] = types.ModuleType("jen")
     sys.modules["jen.plugin_api"] = jen_api
     sys.modules["jen"].plugin_api = jen_api
@@ -376,6 +396,73 @@ def main():
     p._get_db = lambda fdb=fdb: fdb
     p.set_uplink(7, 12)
     check("UPDATE" in fdb.kinds(), "set_uplink: a switch in the caller's own subnet can be changed")
+
+    # ── 1.0.4: set_uplink validates `value` and does not claim success on 0 rows ──
+    fdb = FakeDB([{"id": 7, "host": "10.1.0.2", "enabled": 1}])
+    p._get_db = lambda fdb=fdb: fdb
+    flashed.clear()
+    p.request = types.SimpleNamespace(form={"value": "sideways"})
+    p.set_uplink(7, 12)
+    check(
+        fdb.kinds() == ["SELECT"] and any("Pick one" in m for m in flashed),
+        f"set_uplink: an unrecognised value is refused before any UPDATE (got {fdb.kinds()}, {flashed})",
+    )
+    fdb = FakeDB([{"id": 7, "host": "10.1.0.2", "enabled": 1}], rowcount=0)
+    p._get_db = lambda fdb=fdb: fdb
+    flashed.clear()
+    p.request = types.SimpleNamespace(form={"value": "up"})
+    p.set_uplink(7, 999)
+    check(
+        "UPDATE" in fdb.kinds() and any("not found on this switch" in m for m in flashed),
+        f"set_uplink: a stale/garbled ifindex is refused, not reported as updated (got {flashed})",
+    )
+
+    # ── 1.0.4: community polling with no VLANs configured refuses, never wipes the switch ──
+    # each of these three uses its OWN fresh module: they override _run_snmpbulkwalk/_fdb_positions/
+    # _current_subnet_for_mac/_get_db, which the poll and search tests further down still depend on.
+    fresh1 = load_plugin()
+    switch_no_vlans = {"host": "10.1.0.2", "vlan_indexing": "community", "vlans": ""}
+    try:
+        fresh1._fdb_positions(switch_no_vlans, "public", {})
+        raised = False
+    except fresh1._PollError as e:
+        raised = "VLAN" in str(e)
+    check(raised, "_fdb_positions: community indexing with no VLANs configured raises _PollError, not {}")
+
+    # ── 1.0.4: a DB failure recording a poll does not put its own text in a rendered column ──
+    fresh2 = load_plugin()
+    fresh2._run_snmpbulkwalk = lambda *a, **k: ""
+    fresh2._fdb_positions = lambda *a, **k: {}
+    recorded = []
+    fresh2._record_poll_result = lambda switch_id, error: recorded.append(error)
+
+    def db_down_poll(*a, **k):
+        raise RuntimeError("Access denied for user 'jen'@'10.9.9.9' marker-q96")
+
+    fresh2._get_db = db_down_poll
+    fresh2._poll_switch({"id": 7, "name": "sw", "host": "10.1.0.2", "community": ""})
+    check(
+        recorded and "marker-q96" not in recorded[-1] and "10.9.9.9" not in recorded[-1],
+        f"_poll_switch: a DB failure's own text never reaches sp_switches.last_error (got {recorded})",
+    )
+
+    # ── 1.0.4: the search provider raises the candidate pool without lowering the result cap ──
+    fresh3 = load_plugin()
+    many_rows = [{"mac": f"aa:bb:cc:dd:ee:{i:02x}", "switch_name": "s", "ifname": "Gi1"} for i in range(200)]
+    fresh3._current_subnet_for_mac = lambda mac: 1
+    fresh3._can = everything
+    sql = None
+
+    class _CapturingDB(FakeDB):
+        def execute(self, sql_text, params=()):
+            nonlocal sql
+            sql = sql_text
+            super().execute(sql_text, params)
+
+    fresh3._get_db = lambda: _CapturingDB([list(many_rows)])
+    got = fresh3._switchport_search("Gi", [], True)
+    check("LIMIT 200" in sql, f"_switchport_search: the candidate pool is 200, not 20 (got {sql!r})")
+    check(len(got) == 20, f"_switchport_search: still stops at 20 results (got {len(got)})")
     fdb = FakeDB([{"id": 7, "host": "core-sw.lan", "enabled": 1}])
     p._get_db = lambda fdb=fdb: fdb
     p._can = everything
