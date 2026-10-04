@@ -62,7 +62,7 @@ def _stub_jen_plugin_api():
     not run more often than PERIODIC_MIN_MINUTES (5). A plugin that breaks either raises at register()
     in Jen, is swallowed by its per-plugin error handling, and never loads - the way watchdog 1.0.0 and
     dns-sync 1.0.0 shipped dead (Q89). Returns the registered calls."""
-    calls = {"alert_types": [], "periodic": [], "row_actions": [], "search": []}
+    calls = {"alert_types": [], "periodic": [], "row_actions": [], "search": [], "investigation": []}
 
     # Jen's own tests (tests/test_q57_quickwins.py, tests/test_icons.py) hold every alert type to these two
     # lists: a default template must open with one of the four standard glyphs, and the icon must be one the
@@ -95,6 +95,7 @@ def _stub_jen_plugin_api():
     plugin_api.register_periodic = register_periodic
     plugin_api.register_row_action = lambda *a, **k: calls["row_actions"].append(a)
     plugin_api.register_search_provider = lambda *a, **k: calls["search"].append(a)
+    plugin_api.register_investigation_provider = lambda *a, **k: calls["investigation"].append((a, k))
     plugin_api.api_key_required = lambda write=False: lambda fn: fn
 
     def normalize_mac(raw):
@@ -643,6 +644,84 @@ def main():
     check(
         len(calls["row_actions"]) == 3 and len(calls["search"]) == 1,
         "register(): three row actions and one search provider",
+    )
+    check(
+        len(calls["investigation"]) == 1
+        and calls["investigation"][0][0] == ("switchport",)
+        and calls["investigation"][0][1]["fn"] is p._investigate,
+        "register(): exactly one investigation provider, the plugin's own",
+    )
+
+    # ── 1.1.0: the investigation provider ────────────────────────────────────
+    check(
+        p.in_scope(1, [1], False) and not p.in_scope(2, [1], False) and not p.in_scope(None, [1], False),
+        "in_scope: a restricted caller sees only its own subnets, and None is never allow",
+    )
+    check(p.in_scope(None, [], True), "in_scope: an unrestricted caller sees an unattributed MAC")
+    check(p.investigation_card([]) is None, "investigation_card: a MAC never located adds no card")
+    here = {
+        "switch_name": "sw1", "ifindex": 3, "ifname": "Gi1/0/3", "ifalias": "desk 12", "is_uplink": None, "mac_count": 1,
+        "vlan": 20, "first_seen": None, "last_seen": None,
+    }  # fmt: skip
+    card = p.investigation_card([here])
+    check(
+        card["status"] == "ok"
+        and "sw1" in card["summary"]
+        and "Gi1/0/3" in card["summary"]
+        and "VLAN 20" in card["summary"],
+        f"investigation_card: the switch, port and VLAN in the summary (got {card['summary']!r})",
+    )
+    check(
+        {"label": "Port", "value": "Gi1/0/3 - desk 12"} in card["rows"],
+        "investigation_card: the port row carries the alias",
+    )
+    old = dict(here, switch_name="sw0", ifname="Gi0/9")
+    moved = p.investigation_card([here, old])
+    check(
+        "moved" in moved["summary"] and "sw0" in moved["summary"] and moved["status"] == "ok",
+        f"investigation_card: a second switch's older position reads as a move (got {moved['summary']!r})",
+    )
+    pinned = p.investigation_card([dict(here, is_uplink=1)])
+    check(
+        pinned["status"] == "warn" and "uplink" in pinned["summary"],
+        "investigation_card: a port now treated as an uplink is a warn card",
+    )
+    crowded = p.investigation_card([dict(here, mac_count=40)])
+    check(crowded["status"] == "warn", "investigation_card: past the MAC-count threshold is an uplink too")
+    unpinned = p.investigation_card([dict(here, is_uplink=0, mac_count=40)])
+    check(unpinned["status"] == "ok", "investigation_card: a hand pin to NOT an uplink beats the count")
+
+    # the impure provider, end to end through the plugin's own query and scope check
+    subject = types.SimpleNamespace(mac="AA:BB:CC:DD:EE:01")
+    p._current_subnet_for_mac = lambda mac: 1
+    fdb = FakeDB([[dict(here)]])
+    p._get_db = lambda: fdb
+    got = p._investigate(subject, [1], False)
+    check(
+        got is not None and got["href"] == "/network/switchport?mac=aa:bb:cc:dd:ee:01" and "sw1" in got["summary"],
+        f"_investigate: the card for a seeded client, linking to the plugin's own page (got {got})",
+    )
+    check(
+        "mp.mac=%s" in fdb.statements[0][1] and fdb.statements[0][2] == ("aa:bb:cc:dd:ee:01",),
+        "_investigate: the lookup is the one parameterised MAC query",
+    )
+    p._get_db = lambda: FakeDB([[]])
+    check(p._investigate(subject, [1], False) is None, "_investigate: an unknown client gets None")
+    fdb = FakeDB([[dict(here)]])
+    p._get_db = lambda: fdb
+    check(
+        p._investigate(subject, [2], False) is None and fdb.statements == [],
+        "_investigate: a client in a subnet outside the caller's set is None, and the table is never read",
+    )
+    p._current_subnet_for_mac = lambda mac: None
+    check(
+        p._investigate(subject, [1], False) is None and p._investigate(subject, [], True) is not None,
+        "_investigate: a client with no subnet is for an unrestricted caller only",
+    )
+    check(
+        p._investigate(types.SimpleNamespace(mac=""), [1], True) is None
+        and p._investigate(types.SimpleNamespace(mac="not-a-mac"), [1], True) is None,
+        "_investigate: a subject with no (or an invalid) MAC gets None",
     )
 
     if failures:
