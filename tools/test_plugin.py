@@ -660,8 +660,8 @@ def main():
     check(p.in_scope(None, [], True), "in_scope: an unrestricted caller sees an unattributed MAC")
     check(p.investigation_card([]) is None, "investigation_card: a MAC never located adds no card")
     here = {
-        "switch_name": "sw1", "ifindex": 3, "ifname": "Gi1/0/3", "ifalias": "desk 12", "is_uplink": None, "mac_count": 1,
-        "vlan": 20, "first_seen": None, "last_seen": None,
+        "switch_name": "sw1", "host": "10.1.0.2", "ifindex": 3, "ifname": "Gi1/0/3", "ifalias": "desk 12", "is_uplink": None,
+        "mac_count": 1, "vlan": 20, "first_seen": None, "last_seen": None,
     }  # fmt: skip
     card = p.investigation_card([here])
     check(
@@ -691,9 +691,66 @@ def main():
     unpinned = p.investigation_card([dict(here, is_uplink=0, mac_count=40)])
     check(unpinned["status"] == "ok", "investigation_card: a hand pin to NOT an uplink beats the count")
 
+    # ── 1.1.1: each STORED position is judged by its OWN switch's subnet (the one its address is in) ──
+    import datetime as _dt
+
+    smap = {1: {"cidr": "10.1.0.0/24"}, 2: {"cidr": "10.2.0.0/24"}}
+    in_b = dict(
+        here,
+        switch_name="sw-b",
+        host="10.2.0.9",
+        ifname="Gi2/0/1",
+        ifalias="",
+        last_seen=_dt.datetime(2026, 10, 2, 9, 30),
+    )
+    in_a = dict(here, switch_name="sw-a", host="10.1.0.2", ifname="Gi1/0/3")
+    by_name = dict(here, switch_name="sw-name", host="core-sw.lan")
+    vis, hidden = p.positions_in_scope([in_a], smap, [1], False)
+    check(
+        vis == [in_a] and hidden is False,
+        "positions_in_scope: a position on a switch in the caller's subnet is visible",
+    )
+    vis, hidden = p.positions_in_scope([in_b], smap, [1], False)
+    check(
+        vis == [] and hidden is True,
+        "positions_in_scope: a position on a switch in another subnet is not, and the newest was hidden",
+    )
+    vis, hidden = p.positions_in_scope([in_b, in_a], smap, [1], False)
+    check(
+        vis == [in_a] and hidden is True,
+        "positions_in_scope: a mix keeps only the visible position, and says the newest one was hidden",
+    )
+    vis, hidden = p.positions_in_scope([in_a, in_b], smap, [1], False)
+    check(
+        vis == [in_a] and hidden is False,
+        "positions_in_scope: an older hidden position does not make the newest 'hidden'",
+    )
+    check(
+        p.positions_in_scope([by_name], smap, [1], False)[0] == []
+        and p.positions_in_scope([by_name], smap, [], True)[0] == [by_name],
+        "positions_in_scope: a switch addressed by hostname has no subnet - unrestricted callers only, never read as allow",
+    )
+    check(
+        p.positions_in_scope([in_b, in_a], smap, [1, 2], False)[0] == [in_b, in_a]
+        and p.positions_in_scope([in_b, in_a], smap, [], True) == ([in_b, in_a], False),
+        "positions_in_scope: a caller who may see both switches, or every subnet, sees every position",
+    )
+    last = p.investigation_card([in_a], newest_hidden=True)
+    check(
+        last["summary"].startswith("Last seen on sw-a") and "moved" not in last["summary"],
+        f"investigation_card: when the newest position was hidden the card says 'last seen', not 'on' (got {last['summary']!r})",
+    )
+    stamped = p.investigation_card([dict(in_a, last_seen=_dt.datetime(2026, 10, 1, 7, 0))], newest_hidden=True)
+    check("at 2026-10-01 07:00 UTC" in stamped["summary"], "investigation_card: 'last seen' carries its time")
+    check(
+        "moved" not in p.investigation_card([in_a, dict(old, host="10.1.0.5")], newest_hidden=True)["summary"],
+        "investigation_card: no claim about a move when the newest position is not shown",
+    )
+
     # the impure provider, end to end through the plugin's own query and scope check
     subject = types.SimpleNamespace(mac="AA:BB:CC:DD:EE:01")
     p._current_subnet_for_mac = lambda mac: 1
+    p._subnet_map = lambda: smap
     fdb = FakeDB([[dict(here)]])
     p._get_db = lambda: fdb
     got = p._investigate(subject, [1], False)
@@ -707,16 +764,50 @@ def main():
     )
     p._get_db = lambda: FakeDB([[]])
     check(p._investigate(subject, [1], False) is None, "_investigate: an unknown client gets None")
-    fdb = FakeDB([[dict(here)]])
-    p._get_db = lambda: fdb
+    # the leak direction: stored on a switch in B, the client has since moved to A - a caller scoped to A must NOT see it
+    p._get_db = lambda: FakeDB([[dict(in_b)]])
     check(
-        p._investigate(subject, [2], False) is None and fdb.statements == [],
-        "_investigate: a client in a subnet outside the caller's set is None, and the table is never read",
+        p._investigate(subject, [1], False) is None,
+        "_investigate: a client whose only positions are on switches in B gets no card for a caller scoped to A, wherever it is now",
     )
-    p._current_subnet_for_mac = lambda mac: None
+    p._get_db = lambda: FakeDB([[dict(in_b)]])
+    check(
+        p._investigate(subject, [1, 2], False) is not None and p._investigate(subject, [], True) is not None,
+        "_investigate: the same position is shown to a caller who may see B, and to an unrestricted one",
+    )
+    p._get_db = lambda: FakeDB([[dict(in_b), dict(in_a)]])
+    mixed = p._investigate(subject, [1], False)
+    check(
+        mixed is not None
+        and "sw-b" not in str(mixed)
+        and "Gi2/0/1" not in str(mixed)
+        and mixed["summary"].startswith("Last seen on sw-a"),
+        f"_investigate: a mix shows only the visible switch, as 'last seen' because the newest was hidden (got {mixed})",
+    )
+    p._get_db = lambda: FakeDB([[dict(in_a), dict(in_b)]])
+    older_hidden = p._investigate(subject, [1], False)
+    check(
+        older_hidden is not None
+        and older_hidden["summary"].startswith("On sw-a")
+        and "sw-b" not in str(older_hidden)
+        and "moved" not in older_hidden["summary"],
+        f"_investigate: the newest visible, an older one hidden: 'on', no move claim, no hidden name (got {older_hidden})",
+    )
+    p._get_db = lambda: FakeDB([[dict(in_b, ifname=f"Gi9/0/{i}") for i in range(6)] + [dict(in_a)]])
+    check(
+        p._investigate(subject, [1], False) is not None,
+        "_investigate: six hidden positions do not push a visible one out of the card (the LIMIT comes after the scope)",
+    )
+    p._get_db = lambda: FakeDB([[dict(by_name)]])
     check(
         p._investigate(subject, [1], False) is None and p._investigate(subject, [], True) is not None,
-        "_investigate: a client with no subnet is for an unrestricted caller only",
+        "_investigate: a switch addressed by hostname is for an unrestricted caller only",
+    )
+    p._current_subnet_for_mac = lambda mac: None  # the client's own subnet no longer decides anything
+    p._get_db = lambda: FakeDB([[dict(here)]])
+    check(
+        p._investigate(subject, [1], False) is not None,
+        "_investigate: where the client is now neither widens nor narrows what its stored positions show",
     )
     check(
         p._investigate(types.SimpleNamespace(mac=""), [1], True) is None
