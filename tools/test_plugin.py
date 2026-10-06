@@ -612,16 +612,26 @@ def main():
     p._switch_rows = list
     p.url_for = lambda *a, **k: "/x"
     for label, can, positions, expected in (
-        ("A-newest-on-B, an A caller: the A switch, as 'last seen'", only_one, [pos_b, pos_a], ("sw-a", True)),
-        ("newest on A: the A switch, 'is on'", only_one, [pos_a, pos_b], ("sw-a", False)),
+        (
+            "A-newest-on-B, an A caller: the A switch, 'last seen' (a restricted caller)",
+            only_one,
+            [pos_b, pos_a],
+            ("sw-a", True),
+        ),
+        (
+            "newest on A, an A caller: the same words, 'last seen' (never 'is on')",
+            only_one,
+            [pos_a, pos_b],
+            ("sw-a", True),
+        ),
         ("only on B: not located", only_one, [pos_b], None),
-        ("an unrestricted caller: the newest, B", everything, [pos_b, pos_a], ("sw-b", False)),
+        ("an unrestricted caller: the newest, B, 'is on'", everything, [pos_b, pos_a], ("sw-b", False)),
     ):
         p._can = can
         p._get_db = lambda positions=positions: FakeDB([[dict(x) for x in positions]])
         p.request = types.SimpleNamespace(args={"mac": "AA:BB:CC:DD:EE:01"})
         located = p.index()["located"]
-        got = (located.get("switch_name"), located.get("not_latest")) if located.get("switch_name") else None
+        got = (located.get("switch_name"), located.get("restricted")) if located.get("switch_name") else None
         check(got == expected, f"index: {label} (got {got})")
         check(
             ("sw-b" not in str(located)) == (expected is None or expected[0] == "sw-a"),
@@ -784,25 +794,27 @@ def main():
     )
     in_a = dict(here, switch_name="sw-a", host="10.1.0.2", ifname="Gi1/0/3")
     by_name = dict(here, switch_name="sw-name", host="core-sw.lan")
-    vis, hidden = p.positions_in_scope([in_a], smap, [1], False)
+    vis, restricted = p.positions_in_scope([in_a], smap, [1], False)
     check(
-        vis == [in_a] and hidden is False,
-        "positions_in_scope: a position on a switch in the caller's subnet is visible",
+        vis == [in_a] and restricted is True,
+        "positions_in_scope: a position on a switch in the caller's subnet is visible; a scoped caller is 'restricted'",
     )
-    vis, hidden = p.positions_in_scope([in_b], smap, [1], False)
+    vis, restricted = p.positions_in_scope([in_b], smap, [1], False)
     check(
-        vis == [] and hidden is True,
-        "positions_in_scope: a position on a switch in another subnet is not, and the newest was hidden",
+        vis == [] and restricted is True, "positions_in_scope: a position on a switch in another subnet is not visible"
     )
-    vis, hidden = p.positions_in_scope([in_b, in_a], smap, [1], False)
     check(
-        vis == [in_a] and hidden is True,
-        "positions_in_scope: a mix keeps only the visible position, and says the newest one was hidden",
+        p.positions_in_scope([in_b, in_a], smap, [1], False)
+        == p.positions_in_scope([in_a], smap, [1], False)
+        == p.positions_in_scope([in_a, in_b], smap, [1], False),
+        "positions_in_scope: a scoped caller's answer is the same with a hidden newer position, a hidden older one, or none "
+        "- it carries nothing about the positions it dropped",
     )
-    vis, hidden = p.positions_in_scope([in_a, in_b], smap, [1], False)
     check(
-        vis == [in_a] and hidden is False,
-        "positions_in_scope: an older hidden position does not make the newest 'hidden'",
+        p.positions_in_scope([in_a], smap, [], True)[1] is False
+        and p.positions_in_scope([in_a], smap, [1], False, can=lambda sid: True)[1] is False
+        and p.positions_in_scope([in_a], smap, [1], False, can=lambda sid: sid == 1)[1] is True,
+        "positions_in_scope: 'restricted' is whether the CALLER can see every subnet (None allowed), not a fact about the positions",
     )
     check(
         p.positions_in_scope([by_name], smap, [1], False)[0] == []
@@ -814,16 +826,20 @@ def main():
         and p.positions_in_scope([in_b, in_a], smap, [], True) == ([in_b, in_a], False),
         "positions_in_scope: a caller who may see both switches, or every subnet, sees every position",
     )
-    last = p.investigation_card([in_a], newest_hidden=True)
+    last = p.investigation_card([in_a], restricted=True)
     check(
         last["summary"].startswith("Last seen on sw-a") and "moved" not in last["summary"],
-        f"investigation_card: when the newest position was hidden the card says 'last seen', not 'on' (got {last['summary']!r})",
+        f"investigation_card: a restricted caller's card says 'last seen', never 'on' (got {last['summary']!r})",
     )
-    stamped = p.investigation_card([dict(in_a, last_seen=_dt.datetime(2026, 10, 1, 7, 0))], newest_hidden=True)
+    stamped = p.investigation_card([dict(in_a, last_seen=_dt.datetime(2026, 10, 1, 7, 0))], restricted=True)
     check("at 2026-10-01 07:00 UTC" in stamped["summary"], "investigation_card: 'last seen' carries its time")
     check(
-        "moved" not in p.investigation_card([in_a, dict(old, host="10.1.0.5")], newest_hidden=True)["summary"],
-        "investigation_card: no claim about a move when the newest position is not shown",
+        "moved" not in p.investigation_card([in_a, dict(old, host="10.1.0.5")], restricted=True)["summary"],
+        "investigation_card: a restricted caller's card makes no claim about a move",
+    )
+    check(
+        p.investigation_card([in_a], restricted=False)["summary"].startswith("On sw-a"),
+        "investigation_card: an unrestricted caller keeps 'On' when the newest position is theirs",
     )
 
     # the impure provider, end to end through the plugin's own query and scope check
@@ -867,11 +883,50 @@ def main():
     older_hidden = p._investigate(subject, [1], False)
     check(
         older_hidden is not None
-        and older_hidden["summary"].startswith("On sw-a")
+        and older_hidden["summary"].startswith("Last seen on sw-a")
         and "sw-b" not in str(older_hidden)
         and "moved" not in older_hidden["summary"],
-        f"_investigate: the newest visible, an older one hidden: 'on', no move claim, no hidden name (got {older_hidden})",
+        f"_investigate: the newest visible, an older one hidden: the same 'last seen' words, no move claim, no hidden name (got {older_hidden})",
     )
+    # 1.1.3: a scoped caller's output is IDENTICAL with or without a hidden position - the card, the page and the API
+    p._get_db = lambda: FakeDB([[dict(in_a)]])
+    card_without = p._investigate(subject, [1], False)
+    p._can = only_one
+    p.render_template = lambda name, **kw: kw
+    real_rows = p._switch_rows
+    p._switch_rows = list
+    p.request = types.SimpleNamespace(args={"mac": "aa:bb:cc:dd:ee:01"})
+    page_without = p.index()["located"]
+    sys.modules["jen.plugin_api"].api_key_can_access_subnet = key_can  # the register() stub above replaced the module
+    sys.modules["flask"].g = types.SimpleNamespace(api_key={"subnet_ids": [1]})
+    api_without = p._api_locate("aa:bb:cc:dd:ee:01")
+    for label, world in (
+        ("a NEWER hidden position on B", [in_b, in_a]),
+        ("an OLDER hidden position on B", [in_a, in_b]),
+        ("two hidden positions on B around it", [in_b, in_a, dict(in_b, ifname="Gi2/0/2")]),
+    ):
+        p._get_db = lambda world=world: FakeDB([[dict(x) for x in world]])
+        check(
+            p._investigate(subject, [1], False) == card_without,
+            f"_investigate: with {label} the A-scoped card is identical to the same world without B",
+        )
+        p._get_db = lambda world=world: FakeDB([[dict(x) for x in world]])
+        check(
+            p.index()["located"] == page_without,
+            f"index: with {label} the A-scoped page is identical to the same world without B",
+        )
+        p._get_db = lambda world=world: FakeDB([[dict(x) for x in world]])
+        check(
+            p._api_locate("aa:bb:cc:dd:ee:01") == api_without,
+            f"_api_locate: with {label} the A-scoped key's answer is identical to the same world without B",
+        )
+    p._get_db = lambda: FakeDB([[dict(in_a)]])
+    check(
+        p._investigate(subject, [], True)["summary"].startswith("On sw-a"),
+        "_investigate: an unrestricted caller keeps 'On' when the newest position is theirs",
+    )
+    p.request = None
+    p._switch_rows = real_rows
     p._get_db = lambda: FakeDB([[dict(in_b, ifname=f"Gi9/0/{i}") for i in range(6)] + [dict(in_a)]])
     check(
         p._investigate(subject, [1], False) is not None,
