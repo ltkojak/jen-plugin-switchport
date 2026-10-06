@@ -546,16 +546,61 @@ def main():
 
     # ── 1.0.1: a move sends the alert, in the MAC's own subnet, and the event ─
     sent, emitted = [], []
-    jen_api.send_alert = lambda alert_type, subnet_id=None, **kw: sent.append((alert_type, subnet_id, kw))
+    jen_api.send_alert = lambda alert_type, subnet_id=None, scoped=False, **kw: sent.append(
+        (alert_type, subnet_id, scoped, kw)
+    )
     jen_api.emit = lambda kind, **kw: emitted.append((kind, kw))
     p._port_label = lambda switch_id, ifindex: f"sw{switch_id}:{ifindex}"
+    # ── 1.1.4: a move is announced in the subnet of the SWITCHES it names, never the client's own ─
+    # switch ids 1 and 2 are in subnet 2 (B), 3 is in subnet 3 (C), 4 is hostname-addressed (unattributable);
+    # the client is in subnet 1 (A) in every case: that must decide nothing
+    switch_subnet = {1: 2, 2: 2, 3: 3, 4: None}
+    p._switch_subnet_by_id = lambda switch_id: switch_subnet.get(switch_id)
     p._current_subnet_for_mac = lambda mac: 1
-    p._emit_move("aa:bb:cc:dd:ee:ff", (1, 12), (2, 7))
+    for label, old, new, expect_subnet in (
+        ("both switches in B: the move is B's", (1, 12), (2, 7), 2),
+        ("B then C: no one subnet, unrestricted only", (1, 12), (3, 7), None),
+        ("B then an unattributable switch: unrestricted only", (1, 12), (4, 7), None),
+        ("two unattributable switches: unrestricted only, never 'the same subnet None'", (4, 1), (4, 2), None),
+    ):
+        sent.clear()
+        emitted.clear()
+        p._emit_move("aa:bb:cc:dd:ee:ff", old, new)
+        expect_alert = (
+            "switchport_moved",
+            expect_subnet,
+            True,
+            {"mac": "aa:bb:cc:dd:ee:ff", "old": f"sw{old[0]}:{old[1]}", "new": f"sw{new[0]}:{new[1]}"},
+        )
+        check(sent == [expect_alert], f"_emit_move: {label} - the alert (got {sent})")
+        check(
+            len(emitted) == 1
+            and emitted[0][0] == "plugin.switchport.moved"
+            and emitted[0][1]["subnet_id"] == expect_subnet,
+            f"_emit_move: {label} - the Timeline event carries the same subnet (got {emitted})",
+        )
+    check(all(c[1] != 1 for c in sent), "_emit_move: the client's own subnet (A) is never what a move is announced in")
+
+    # _move_subnet reads the switches through the stored hosts and Jen's subnet map
+    p2 = load_plugin()
+    p2._subnet_map = lambda: {2: {"cidr": "10.2.0.0/24"}, 3: {"cidr": "10.3.0.0/24"}}
+    hosts = {1: "10.2.0.2", 2: "10.2.0.3", 3: "10.3.0.2", 4: "core-sw.lan"}
+
+    def hosts_db(*ids):
+        fdb = FakeDB([{"host": hosts[i]} for i in ids])  # ONE connection object: its rows are consumed in order
+        return lambda: fdb
+
+    p2._get_db = hosts_db(1, 2)
     check(
-        sent == [("switchport_moved", 1, {"mac": "aa:bb:cc:dd:ee:ff", "old": "sw1:12", "new": "sw2:7"})],
-        f"_emit_move: sends switchport_moved for the MAC's own subnet (got {sent})",
+        p2._move_subnet((1, 1), (2, 1)) == 2,
+        "_move_subnet: two switches in the same subnet read from their stored hosts",
     )
-    check(emitted and emitted[0][0] == "plugin.switchport.moved", "_emit_move: still emits the Timeline event")
+    p2._get_db = hosts_db(1, 3)
+    check(p2._move_subnet((1, 1), (3, 1)) is None, "_move_subnet: switches in different subnets is None")
+    p2._get_db = hosts_db(4, 4)
+    check(p2._move_subnet((4, 1), (4, 2)) is None, "_move_subnet: two hostname-addressed switches is None, not 'equal'")
+    p2._get_db = hosts_db()
+    check(p2._move_subnet((8, 1), (9, 1)) is None, "_move_subnet: switches that no longer exist are None")
 
     # ── 1.0.1: the locate API — a MAC with no subnet is for an unrestricted key only ─
     def key_can(key, subnet_id, *, allow_unattributed=False):
