@@ -449,9 +449,11 @@ def main():
 
     # ── 1.0.4: the search provider raises the candidate pool without lowering the result cap ──
     fresh3 = load_plugin()
-    many_rows = [{"mac": f"aa:bb:cc:dd:ee:{i:02x}", "switch_name": "s", "ifname": "Gi1"} for i in range(200)]
-    fresh3._current_subnet_for_mac = lambda mac: 1
-    fresh3._can = everything
+    many_rows = [
+        {"mac": f"aa:bb:cc:dd:ee:{i:02x}", "switch_name": "s", "host": "10.1.0.2", "ifname": "Gi1"} for i in range(200)
+    ]
+    fresh3._subnet_map = lambda: {1: {"cidr": "10.1.0.0/24"}, 2: {"cidr": "10.2.0.0/24"}}
+    fresh3.url_for = lambda *a, **k: "/x"
     sql = None
 
     class _CapturingDB(FakeDB):
@@ -563,39 +565,116 @@ def main():
         return subnet_id is not None and subnet_id in scope
 
     jen_api.api_key_can_access_subnet = key_can
-    p._locate_mac = lambda mac: None
-    for label, sid, key, expect in (
-        ("a scoped key, MAC in its subnet", 1, {"subnet_ids": [1]}, "ok"),
-        ("a scoped key, MAC in another subnet", 2, {"subnet_ids": [1]}, 403),
-        ("a scoped key, MAC with no subnet", None, {"subnet_ids": [1]}, 403),
-        ("an unrestricted key, MAC with no subnet", None, {"subnet_ids": None}, "ok"),
+    # ── 1.1.2: the page, the API and the search all judge each stored position by ITS switch's subnet ──
+    smap_q = {1: {"name": "A", "cidr": "10.1.0.0/24"}, 2: {"name": "B", "cidr": "10.2.0.0/24"}}
+    p._subnet_map = lambda: smap_q
+    pos_a = {
+        "switch_name": "sw-a", "host": "10.1.0.2", "ifindex": 3, "ifname": "Gi1/0/3", "ifalias": "desk", "is_uplink": None,
+        "mac_count": 1, "vlan": 20, "first_seen": None, "last_seen": None,
+    }  # fmt: skip
+    pos_b = dict(pos_a, switch_name="sw-b", host="10.2.0.9", ifname="Gi2/0/1", ifalias="rack", vlan=30)
+    pos_name = dict(pos_a, switch_name="sw-name", host="core-sw.lan")
+    # the client is in subnet 1 NOW in every case below: that must decide nothing about the stored positions
+    p._current_subnet_for_mac = lambda mac: 1
+    for label, positions, key, expect_switch in (
+        ("A-newest-on-B: a key scoped to A is given the A switch only", [pos_b, pos_a], {"subnet_ids": [1]}, "sw-a"),
+        ("newest on A, older on B: the A switch", [pos_a, pos_b], {"subnet_ids": [1]}, "sw-a"),
+        ("only on B: a key scoped to A is told 'not located'", [pos_b], {"subnet_ids": [1]}, None),
+        ("only on a hostname-addressed switch, a scoped key", [pos_name], {"subnet_ids": [1]}, None),
+        ("A-newest-on-B, an unrestricted key sees the newest (B)", [pos_b, pos_a], {"subnet_ids": None}, "sw-b"),
+        ("a key scoped to both sees the newest", [pos_b, pos_a], {"subnet_ids": [1, 2]}, "sw-b"),
+        ("a scoped key, a MAC no switch has reported", [], {"subnet_ids": [1]}, None),
     ):
-        p._current_subnet_for_mac = lambda mac, sid=sid: sid
+        p._get_db = lambda positions=positions: FakeDB([[dict(x) for x in positions]])
         sys.modules["flask"].g = types.SimpleNamespace(api_key=key)
         result = p._api_locate("aa:bb:cc:dd:ee:01")
-        got = result[1] if isinstance(result, tuple) else "ok"
-        check(got == expect, f"_api_locate: {label} -> {expect}")
+        body = result[0] if isinstance(result, tuple) else result
+        check(
+            not isinstance(result, tuple)
+            and body.get("located") is (expect_switch is not None)
+            and body.get("switch") == expect_switch
+            and ("sw-b" not in str(body) or expect_switch == "sw-b"),
+            f"_api_locate: {label} (got {result})",
+        )
+    # the API no longer refuses a scoped key because of the MAC's own subnet: same answer for every unseen MAC
+    p._current_subnet_for_mac = lambda mac: 2
+    p._get_db = lambda: FakeDB([[dict(pos_a)]])
+    sys.modules["flask"].g = types.SimpleNamespace(api_key={"subnet_ids": [1]})
+    check(
+        p._api_locate("aa:bb:cc:dd:ee:01").get("switch") == "sw-a",
+        "_api_locate: a position on the key's own switch is returned whatever subnet the MAC is in now",
+    )
+    p._current_subnet_for_mac = lambda mac: 1
 
-    # ── 1.0.1: the search provider returns the MAC's REAL subnet ─────────────
+    # the page: index() through the same judgement
+    p.render_template = lambda name, **kw: kw
+    real_switch_rows = p._switch_rows
+    p._switch_rows = list
+    p.url_for = lambda *a, **k: "/x"
+    for label, can, positions, expected in (
+        ("A-newest-on-B, an A caller: the A switch, as 'last seen'", only_one, [pos_b, pos_a], ("sw-a", True)),
+        ("newest on A: the A switch, 'is on'", only_one, [pos_a, pos_b], ("sw-a", False)),
+        ("only on B: not located", only_one, [pos_b], None),
+        ("an unrestricted caller: the newest, B", everything, [pos_b, pos_a], ("sw-b", False)),
+    ):
+        p._can = can
+        p._get_db = lambda positions=positions: FakeDB([[dict(x) for x in positions]])
+        p.request = types.SimpleNamespace(args={"mac": "AA:BB:CC:DD:EE:01"})
+        located = p.index()["located"]
+        got = (located.get("switch_name"), located.get("not_latest")) if located.get("switch_name") else None
+        check(got == expected, f"index: {label} (got {got})")
+        check(
+            ("sw-b" not in str(located)) == (expected is None or expected[0] == "sw-a"),
+            "index: the page context never carries the hidden switch",
+        )
+    p.request = types.SimpleNamespace(args={"mac": "aa:bb:cc:dd:ee:01"})
+    p._get_db = lambda: (_ for _ in ()).throw(RuntimeError("db down marker-q147"))
+    check(
+        p.index()["located"] == {"mac": "aa:bb:cc:dd:ee:01"},
+        "index: a database failure while locating reads as 'not reported', no exception text",
+    )
+    p.request = None
+    p._switch_rows = real_switch_rows
+
+    # ── the search provider: the row carries the SWITCH's subnet, and hidden switches' rows never leave ──
     rows = [
-        {"mac": "aa:bb:cc:dd:ee:01", "switch_name": "s", "ifname": "Gi1"},
-        {"mac": "aa:bb:cc:dd:ee:02", "switch_name": "s", "ifname": "Gi2"},
-        {"mac": "aa:bb:cc:dd:ee:03", "switch_name": "s", "ifname": "Gi3"},
+        {"mac": "aa:bb:cc:dd:ee:01", "switch_name": "sw-a", "host": "10.1.0.2", "ifname": "Gi1"},
+        {"mac": "aa:bb:cc:dd:ee:02", "switch_name": "sw-b", "host": "10.2.0.9", "ifname": "Gi2"},
+        {"mac": "aa:bb:cc:dd:ee:03", "switch_name": "sw-name", "host": "core-sw.lan", "ifname": "Gi3"},
     ]
-    subnet_of = {"aa:bb:cc:dd:ee:01": 1, "aa:bb:cc:dd:ee:02": 2, "aa:bb:cc:dd:ee:03": None}
-    p._current_subnet_for_mac = lambda mac: subnet_of[mac]
-    for label, can, expected in (
-        ("a scoped caller", only_one, {"aa:bb:cc:dd:ee:01": 1}),
+    # every client is in subnet 1 now, so a row reporting the CLIENT's subnet would pass for all three
+    p._current_subnet_for_mac = lambda mac: 1
+    for label, accessible, all_subnets, expected in (
+        ("a scoped caller", [1], False, {"aa:bb:cc:dd:ee:01": 1}),
+        ("a caller scoped to B", [2], False, {"aa:bb:cc:dd:ee:02": 2}),
         (
             "an unrestricted caller",
-            everything,
+            [],
+            True,
             {"aa:bb:cc:dd:ee:01": 1, "aa:bb:cc:dd:ee:02": 2, "aa:bb:cc:dd:ee:03": None},
         ),
     ):
         p._get_db = lambda: FakeDB([list(rows)])
-        p._can = can
-        got = {r["title"]: r["subnet_id"] for r in p._switchport_search("Gi", [], False)}
+        got = {r["title"]: r["subnet_id"] for r in p._switchport_search("Gi", accessible, all_subnets)}
         check(got == expected, f"_switchport_search: {label} gets {expected} (got {got})")
+    # an exact-MAC search: A-newest-on-B shows the A switch only; only-B shows nothing
+    mac_rows = [
+        {"mac": "aa:bb:cc:dd:ee:01", "switch_name": "sw-b", "host": "10.2.0.9", "ifname": "Gi2"},
+        {"mac": "aa:bb:cc:dd:ee:01", "switch_name": "sw-a", "host": "10.1.0.2", "ifname": "Gi1"},
+    ]
+    p._get_db = lambda: FakeDB([[dict(r) for r in mac_rows]])
+    got = [r["subtitle"] for r in p._switchport_search("aa:bb:cc:dd:ee:01", [1], False)]
+    check(got == ["sw-a · Gi1"], f"_switchport_search: an exact MAC, A caller: the A switch only (got {got})")
+    p._get_db = lambda: FakeDB([[dict(mac_rows[0])]])
+    check(
+        p._switchport_search("aa:bb:cc:dd:ee:01", [1], False) == [],
+        "_switchport_search: an exact MAC whose only position is on B finds nothing for an A caller",
+    )
+    p._get_db = lambda: FakeDB([[dict(mac_rows[0])] * 5 + [dict(mac_rows[1])]])
+    check(
+        [r["subtitle"] for r in p._switchport_search("aa:bb:cc:dd:ee:01", [1], False)] == ["sw-a · Gi1"],
+        "_switchport_search: five hidden positions ahead of a visible one do not hide it (the cap comes after the scope)",
+    )
 
     # ── 1.0.3: a database failure never reaches the page ─────────────────────
     def db_down(*a, **k):
