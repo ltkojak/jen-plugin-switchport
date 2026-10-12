@@ -15,8 +15,10 @@ switch's.
 Run: `python3 tools/test_plugin.py` (exit 1 on the first failing check).
 """
 
+import functools
 import importlib.util
 import os
+import pathlib
 import sys
 import types
 
@@ -49,6 +51,44 @@ def _stub_modules():
     fl.current_user = types.SimpleNamespace(username="tester", all_subnets=True, role="admin")
     fl.login_required = lambda fn: fn
     sys.modules["flask_login"] = fl
+
+    # plugin.py imports `require_write` / `is_admin_or_above` / `in_placeholders` from jen.plugin_api at the top (a
+    # decorator has to exist when the route is defined). The three names are put on whatever `jen.plugin_api` module is
+    # current (the later checks swap in narrower stubs and then load_plugin() again), bound to THIS load's
+    # flask_login. The gate is Jen's real one in shape (jen/services/plugin_helpers.py::require_write): an admin
+    # passes, a JSON or /api/ request gets a 403 body, anything else a flash and a redirect; what it did is recorded
+    # in GATE_CALLS so a check can see that a refusal flashed.
+    api = sys.modules.get("jen.plugin_api")
+    if api is None:
+        api = types.ModuleType("jen.plugin_api")
+        jen_pkg = sys.modules.get("jen") or types.ModuleType("jen")
+        jen_pkg.plugin_api = api
+        sys.modules["jen"] = jen_pkg
+        sys.modules["jen.plugin_api"] = api
+
+    def is_admin_or_above():
+        return fl.current_user.role in ("superadmin", "admin")
+
+    def require_write(message="Viewers can look at this but not change it.", redirect_endpoint="dashboard.dashboard"):
+        def deco(fn):
+            @functools.wraps(fn)
+            def wrapped(*args, **kwargs):
+                if is_admin_or_above():
+                    return fn(*args, **kwargs)
+                req = flask.request
+                if req is not None and (req.is_json or req.path.startswith("/api/")):
+                    GATE_CALLS.append(("json", message))
+                    return ({"error": message}, 403)
+                GATE_CALLS.append(("flash", message))
+                return ("gate-redirect", redirect_endpoint)
+
+            return wrapped
+
+        return deco
+
+    api.is_admin_or_above = is_admin_or_above
+    api.require_write = require_write
+    api.in_placeholders = lambda values: ",".join(["%s"] * len(list(values))) if list(values) else "NULL"
 
 
 class _FakeApp:
@@ -128,6 +168,7 @@ def load_plugin():
 
 
 failures = []
+GATE_CALLS = []  # what the stub require_write refused, and how: ("flash", message) or ("json", message)
 
 
 def check(cond, msg):
@@ -294,22 +335,25 @@ def main():
 
     # ── write gate — viewers can look at Switch Ports but not change it ─────
     p.current_user.role = "viewer"
-    check(p._is_admin() is False, "a viewer is not admin")
-    check(p._require_write() is False, "a viewer cannot write")
+    check(p.is_admin_or_above() is False, "a viewer is not admin")
     for fn, args in (
         (p.add_switch, ()),
         (p.toggle_switch, (1,)),
         (p.delete_switch, (1,)),
         (p.set_uplink, (1, 12)),
     ):
+        GATE_CALLS.clear()
         try:
-            fn(*args)
+            answer = fn(*args)
             gated = True
         except Exception:
-            gated = False
-        check(gated, f"{fn.__name__} refuses a viewer before touching the request")
+            answer, gated = None, False
+        check(
+            gated and answer == ("gate-redirect", "switchport.index") and GATE_CALLS == [("flash", p._VIEWER_MESSAGE)],
+            f"{fn.__name__} refuses a viewer before touching the request (plugin_api.require_write: flash + redirect)",
+        )
     p.current_user.role = "admin"
-    check(p._is_admin() is True, "admin role restored for the rest of the run")
+    check(p.is_admin_or_above() is True, "admin role restored for the rest of the run")
 
     # ── 1.0.1: the uplink heuristic's result is visible ───────────────────────
     check(p.port_is_uplink(None, 9) is True, "port_is_uplink: unpinned and over the threshold is an uplink")
@@ -371,7 +415,6 @@ def main():
     p.redirect = lambda where: "redirect"
     p.url_for = lambda *a, **k: "/x"
     p.jsonify = lambda payload: payload
-    p._require_write = lambda: True
     p._subnet_map = lambda: smap
     jen_api = types.ModuleType("jen.plugin_api")
     jen_api.decrypt_secret = lambda s: s
@@ -993,6 +1036,134 @@ def main():
         and p._investigate(types.SimpleNamespace(mac="not-a-mac"), [1], True) is None,
         "_investigate: a subject with no (or an invalid) MAC gets None",
     )
+
+    # ── 1.1.5: a database failure loading a switch is a refusal, not a 500 ───
+    import logging
+
+    class _Capture(logging.Handler):
+        def __init__(self):
+            super().__init__()
+            self.lines = []
+
+        def emit(self, record):
+            self.lines.append(record.getMessage())
+
+    class _Boom(Exception):
+        pass
+
+    def boom_db():
+        raise _Boom("Access denied for user 'jen'@'10.9.9.9' marker-q174")
+
+    s = load_plugin()
+    capture = _Capture()
+    s.logger.addHandler(capture)
+    s._get_db = boom_db
+    row, why = s._load_switch(7)
+    check(
+        row is None and why == "Could not load the switch; the details are in Jen's log.",
+        f"_load_switch: a database failure is a refusal with a generic sentence (got {row!r}, {why!r})",
+    )
+    check(
+        capture.lines
+        and all("marker-q174" not in m and "10.9.9.9" not in m for m in capture.lines)
+        and any("_Boom" in m for m in capture.lines),
+        f"_load_switch: the failure is logged by class name only (got {capture.lines})",
+    )
+    s.logger.removeHandler(capture)
+    said = []
+    s.flash = lambda msg, cat="message": said.append(msg)
+    s.redirect = lambda where: "redirect"
+    s.url_for = lambda *a, **k: "/x"
+    s.request = types.SimpleNamespace(form={"value": "up"}, args={})
+    for name, args in (("toggle_switch", (7,)), ("delete_switch", (7,)), ("set_uplink", (7, 12))):
+        said.clear()
+        check(
+            getattr(s, name)(*args) == "redirect"
+            and said == ["Could not load the switch; the details are in Jen's log."],
+            f"{name}: a database failure while loading the switch is the generic refusal, no exception text (got {said})",
+        )
+
+    # ── 1.1.5: a string that is not a MAC says so; a valid MAC the caller may not see is the not-found answer ──
+    seen = {}
+    s.render_template = lambda name, **kw: seen.update(kw) or kw
+    s._switch_rows = list
+    s._locate_mac = lambda mac, can=None: None  # nothing visible: a missing MAC and a hidden one are the same
+    s.request = types.SimpleNamespace(args={"mac": "not-a-mac"})
+    page = s.index()
+    check(
+        page["located"] is None,
+        "index: a string that is not a MAC has no `located` (the template says it is not a MAC)",
+    )
+    s.request = types.SimpleNamespace(args={"mac": "AA-BB-CC-DD-EE-FF"})
+    page = s.index()
+    check(
+        page["located"] == {"mac": "aa:bb:cc:dd:ee:ff"},
+        f"index: a valid MAC with no visible position is the same answer whether it is missing or hidden (got {page['located']})",
+    )
+
+    try:
+        import jinja2
+    except ImportError:  # the harness is stdlib-only; verify.py (which needs jinja2) parses the template anyway
+        jinja2 = None
+    if jinja2 is not None:
+        # A faithful copy of Jen's templates/_investigate.html (macro + the three kinds) and a bare base: enough to render
+        # the page's own template through the real Jinja and see what the person would read.
+        macro = (
+            '{% macro investigate_link(who, kind="menu") -%}{%- if who -%}'
+            '{%- if kind == "icon" -%}<a href="/client?q={{ who|urlencode }}" class="btn btn-sm btn-secondary" '
+            'title="Investigate {{ who }}">{{ icon("search", "", "Investigate") }}</a>'
+            '{%- else -%}<a href="/client?q={{ who|urlencode }}" class="action-menu-item">{{ icon("search") }} Investigate</a>'
+            "{%- endif -%}{%- endif -%}{%- endmacro %}"
+        )
+        env = jinja2.Environment(
+            loader=jinja2.DictLoader(
+                {
+                    "base.html": "{% block title %}{% endblock %}{% block content %}{% endblock %}",
+                    "_investigate.html": macro,
+                    "switchport/index.html": pathlib.Path(ROOT, "templates", "switchport", "index.html").read_text(
+                        encoding="utf-8"
+                    ),
+                }
+            ),
+            autoescape=True,
+        )
+        env.filters["utcfmt"] = lambda v: str(v)
+        env.globals.update(
+            icon=lambda *a, **k: "[icon]",
+            csrf_token=lambda: "t",
+            url_for=lambda *a, **k: "/x",
+            csp_nonce="n",
+            ipv6_enabled=False,
+        )
+        tpl = env.get_template("switchport/index.html")
+        base_ctx = {"switches": [], "vlan_indexing_choices": ["none"], "uplink_threshold": 8, "is_admin": False}
+        not_a_mac = tpl.render(query_mac="zzz", located=None, **base_ctx)
+        check(
+            "That is not a MAC address." in not_a_mac and "Not a valid or accessible" not in not_a_mac,
+            "template: a string that is not a MAC reads 'That is not a MAC address.'",
+        )
+        missing = tpl.render(query_mac="aa:bb:cc:dd:ee:01", located={"mac": "aa:bb:cc:dd:ee:01"}, **base_ctx)
+        check(
+            "No switch has reported" in missing and "not a MAC" not in missing,
+            "template: a valid MAC with nothing visible reads the not-found sentence, not the parse one",
+        )
+        check(
+            "/client?q=aa%3Abb%3Acc%3Add%3Aee%3A01" in missing,
+            "template: the not-found sentence for a MAC carries the Investigate link (the macro, not a hand-built href)",
+        )
+        found = tpl.render(
+            query_mac="aa:bb:cc:dd:ee:01",
+            located={
+                "mac": "aa:bb:cc:dd:ee:01",
+                "switch_name": "sw",
+                "ifname": "Gi1",
+                "ifindex": 1,
+                "vlan": None,
+                "last_seen": None,
+            },
+            **base_ctx,
+        )
+        check("/client?q=aa%3Abb%3Acc%3Add%3Aee%3A01" in found, "template: a located MAC carries the Investigate link")
 
     if failures:
         print(f"\n{len(failures)} check(s) failed")
